@@ -1,6 +1,6 @@
 # LOAD DATA Examples: MySQL INFILE vs Aurora FROM S3
 
-This repository contains copy-pasteable examples for loading CSV data into MySQL using `LOAD DATA INFILE` and into Amazon Aurora MySQL using `LOAD DATA FROM S3`.
+This repository contains copy-pasteable examples for loading CSV data into MySQL using `LOAD DATA LOCAL INFILE` and into Amazon Aurora MySQL using `LOAD DATA FROM S3`.
 
 ## The key insight
 
@@ -8,18 +8,26 @@ The syntax is nearly identical. The **only** difference is the source clause on 
 
 | Engine | Source clause |
 | --- | --- |
-| Plain MySQL | `LOAD DATA INFILE '/path/to/file.csv'` |
+| Plain MySQL | `LOAD DATA LOCAL INFILE '/path/to/file.csv'` |
 | Aurora MySQL | `LOAD DATA FROM S3 's3-us-east-1://bucket/key.csv'` |
 
 Everything after that — `INTO TABLE`, `FIELDS TERMINATED BY`, `LINES TERMINATED BY`, `IGNORE 1 LINES`, and the column list — is word for word the same in both.
 
 AWS documents this directly: the [Aurora MySQL Load from S3 guide](https://docs.aws.amazon.com/AmazonRDS/latest/AuroraUserGuide/AuroraMySQL.Integrating.LoadFromS3.html) states that `LOAD DATA FROM S3` can load "any text file format that is supported by the MySQL `LOAD DATA INFILE` statement" and mirrors the INFILE parameters one for one. The Aurora docs even point readers to the MySQL LOAD DATA reference for parameter details.
 
+## Why LOCAL INFILE instead of server-side INFILE
+
+Server-side `LOAD DATA INFILE` requires the CSV to sit on the MySQL server's filesystem inside the `secure_file_priv` folder. In a GitLab pipeline that means mounting the file into the service container, which only works on Runners with the Docker socket exposed, privileged mode, or docker-in-docker.
+
+`LOAD DATA LOCAL INFILE` avoids all of that. The **client** (the GitLab job container) reads the CSV from the repo working directory and streams it to the server over the connection. No mounts, no `secure_file_priv` configuration, no special Runner privileges — it works on any Runner that can run Docker containers.
+
+The tradeoff: the entire file travels through the client connection, so it is slower for very large loads. For CI test data that is irrelevant.
+
 ## Files
 
 - `sql/create_table.sql` — sample table definition
 - `sql/sample_customers.csv` — two-row CSV matching the table
-- `sql/load_mysql.sql` — `LOAD DATA INFILE` statement
+- `sql/load_mysql.sql` — `LOAD DATA LOCAL INFILE` statement
 - `sql/load_aurora.sql` — `LOAD DATA FROM S3` statement
 - `.gitlab-ci.yml` — pipeline that tests the MySQL statement against a service container, then (manually) tests the Aurora statement against a real cluster
 
@@ -35,10 +43,10 @@ CREATE TABLE customers (
 );
 ```
 
-## Plain MySQL
+## Plain MySQL (LOCAL INFILE)
 
 ```sql
-LOAD DATA INFILE '/var/lib/mysql-files/customers.csv'
+LOAD DATA LOCAL INFILE '/path/to/repo/sql/sample_customers.csv'
 INTO TABLE customers
 FIELDS TERMINATED BY ',' OPTIONALLY ENCLOSED BY '"'
 LINES TERMINATED BY '\n'
@@ -46,7 +54,10 @@ IGNORE 1 LINES
 (id, name, email, signup_date, balance);
 ```
 
-Reads from the server's `secure_file_priv` folder. Requires the `FILE` privilege. The file must be reachable by the MySQL server process.
+In the pipeline the path is `$CI_PROJECT_DIR/sql/sample_customers.csv` — the path as the job container sees it. Two things must be enabled:
+
+- **Server:** start MySQL with `--local-infile=1` (command flag or config). Without it the server rejects LOCAL requests.
+- **Client:** pass `--local-infile=1` to the `mysql` CLI. The client disables LOCAL INFILE by default as a safety measure.
 
 ## Aurora MySQL from S3
 
@@ -69,20 +80,22 @@ Authenticates purely through an IAM role attached to the cluster — there are n
 
 Extras Aurora supports that plain INFILE does not: a `PREFIX` clause to load multiple files at once, and a `MANIFEST` option pointing at a JSON list of files. A bucket in another region requires the `s3-<region>://` URI form and adds cross-region transfer costs.
 
+Aurora also supports `LOAD DATA LOCAL INFILE` from a client, but that is not what this pipeline uses for the Aurora stage — it tests the real S3 path.
+
 ## Main differences
 
 - **LOCAL:** `LOAD DATA LOCAL INFILE` reads from the *client* machine instead of the server. Aurora supports LOCAL INFILE from a client but has no server-side INFILE at all — S3 replaces it.
-- **Security:** plain MySQL uses file paths and the FILE privilege; Aurora uses the IAM role on the cluster plus a database grant, with no credentials in the SQL.
+- **Security:** plain MySQL uses file paths and the FILE privilege for server-side INFILE; LOCAL INFILE needs no FILE privilege but does need `local_infile=1` on both sides. Aurora uses the IAM role on the cluster plus a database grant, with no credentials in the SQL.
 - **URI format:** `s3://bucket/key` works for a same-region bucket; `s3-<region>://bucket/key` names the region explicitly.
 
 ## GitLab pipeline
 
 The `.gitlab-ci.yml` has two stages:
 
-1. **test-mysql** (automatic) — runs the MySQL 8.0 image as both the job container and a service with alias `mysql`. A before-script loop waits for `mysqladmin ping`, then loads the create-table SQL and the INFILE statement. The CSV is mounted into the container at `/var/lib/mysql-files/customers.csv` via a service-level volume, and the server is started with `--secure-file-priv=/var/lib/mysql-files` so the INFILE path is allowed. The job counts rows in `customers` and fails if it is not 2.
-2. **test-aurora** (manual) — same MySQL client image, but connects to your real Aurora host using CI/CD variables (`AURORA_HOST`, `AURORA_PORT`, `AURORA_USER`, `AURORA_PASSWORD`, `AURORA_DATABASE`). A `sed` one-liner rewrites the INFILE source clause into `LOAD DATA FROM S3` with your bucket URI before running. Then it creates the table, loads, and counts again.
+1. **test-mysql** (automatic) — runs the MySQL 8.0 image as both the job container and a service with alias `mysql`. The service is started with `--local-infile=1` and `--secure-file-priv=NULL`. A before-script loop waits for `mysqladmin ping`, then loads the create-table SQL and the LOCAL INFILE statement, using `$CI_PROJECT_DIR/sql/sample_customers.csv` as the file path and `--local-infile=1` on the client. The job counts rows in `customers` and fails if it is not 2.
+2. **test-aurora** (manual) — same MySQL client image with `--local-infile=1`, but connects to your real Aurora host using CI/CD variables (`AURORA_HOST`, `AURORA_PORT`, `AURORA_USER`, `AURORA_PASSWORD`, `AURORA_DATABASE`). A `sed` one-liner rewrites the LOCAL INFILE source clause into `LOAD DATA FROM S3` with your bucket URI before running. Then it creates the table, loads, and counts again.
 
-**Caveat on volume mounts:** service-level volume mounts only work if your GitLab Runner is configured for it — Docker socket exposed, privileged mode, or docker-in-docker. If your Runner cannot do mounts, switch to `LOAD DATA LOCAL INFILE` with `local_infile=1` enabled on both server and client, which avoids the file-path problem entirely. The pipeline file includes that fallback as a commented alternative.
+No volume mounts, no Runner privileges required.
 
 ## Why this matters for testing
 

@@ -1,10 +1,12 @@
 # Test LOAD DATA statements against MySQL (service) and Aurora (manual).
+# Uses LOAD DATA LOCAL INFILE for the MySQL stage — no volume mounts,
+# no secure_file_priv configuration, no special Runner privileges.
 # The only line that differs between stages is the source clause:
-#   MySQL:  LOAD DATA INFILE '...'
+#   MySQL:  LOAD DATA LOCAL INFILE '...'
 #   Aurora: LOAD DATA FROM S3 's3-...://...'
 
 variables:
-  CSV_PATH: "/var/lib/mysql-files/customers.csv"
+  CSV_PATH: "$CI_PROJECT_DIR/sql/sample_customers.csv"
   S3_URI: "s3-us-east-1://my-bucket/imports/customers.csv"
 
 stages:
@@ -12,11 +14,13 @@ stages:
   - test-aurora
 
 # ---------------------------------------------------------------------------
-# Stage 1: automatic — MySQL 8.0 service container
+# Stage 1: automatic — MySQL 8.0 service container, LOCAL INFILE
 # ---------------------------------------------------------------------------
 test-mysql:
   stage: test-mysql
-  image: mysql:8.0
+  image:
+    name: mysql:8.0
+    entrypoint: [""]
   services:
     - name: mysql:8.0
       alias: mysql
@@ -25,13 +29,8 @@ test-mysql:
         MYSQL_DATABASE: testdb
         MYSQL_USER: testuser
         MYSQL_PASSWORD: testpass
-      # Allow INFILE from the mounted CSV location
-      command: ["--secure-file-priv=/var/lib/mysql-files", "--local-infile=1"]
-      # Mount the sample CSV into the secure_file_priv folder.
-      # Requires a Runner that supports service-level volume mounts
-      # (Docker socket exposed, privileged, or docker-in-docker).
-      # volumes:
-      #   - $CI_PROJECT_DIR/sql/sample_customers.csv:$CSV_PATH:ro
+      # Enable LOCAL INFILE on the server; no secure_file_priv needed
+      command: ["--local-infile=1", "--secure-file-priv=NULL"]
   before_script:
     - |
       for i in $(seq 1 30); do
@@ -40,29 +39,24 @@ test-mysql:
       done
     - mysql -h mysql -uroot -prootpass testdb < sql/create_table.sql
   script:
-    - mysql -h mysql -uroot -prootpass testdb < sql/load_mysql.sql
+    # Client must also allow LOCAL INFILE (disabled by default)
+    - |
+      sed "s|/CI_PROJECT_DIR/sql/sample_customers.csv|$CSV_PATH|" \
+        sql/load_mysql.sql > /tmp/load_local.sql
+    - mysql -h mysql -uroot -prootpass --local-infile=1 testdb < /tmp/load_local.sql
     - |
       COUNT=$(mysql -h mysql -uroot -prootpass testdb -N -e "SELECT COUNT(*) FROM customers;")
       echo "Row count: $COUNT"
       test "$COUNT" = "2"
-  # Fallback if your Runner cannot mount volumes: switch to LOCAL INFILE.
-  # Uncomment and use instead of the script above:
-  # script:
-  #   - mysql -h mysql -uroot -prootpass --local-infile=1 testdb < sql/create_table.sql
-  #   - |
-  #     sed "s|LOAD DATA INFILE '$CSV_PATH'|LOAD DATA LOCAL INFILE '$CI_PROJECT_DIR/sql/sample_customers.csv'|" \
-  #       sql/load_mysql.sql > /tmp/load_local.sql
-  #     mysql -h mysql -uroot -prootpass --local-infile=1 testdb < /tmp/load_local.sql
-  #   - |
-  #     COUNT=$(mysql -h mysql -uroot -prootpass testdb -N -e "SELECT COUNT(*) FROM customers;")
-  #     test "$COUNT" = "2"
 
 # ---------------------------------------------------------------------------
 # Stage 2: manual — real Aurora cluster
 # ---------------------------------------------------------------------------
 test-aurora:
   stage: test-aurora
-  image: mysql:8.0
+  image:
+    name: mysql:8.0
+    entrypoint: [""]
   rules:
     - when: manual
   variables:
@@ -77,13 +71,13 @@ test-aurora:
         mysqladmin ping -h "$AURORA_HOST" -P "$AURORA_PORT" -u"$AURORA_USER" -p"$AURORA_PASSWORD" --silent && break
         sleep 2
       done
-    # Rewrite the INFILE source clause into LOAD DATA FROM S3 — the only line that changes
+    # Rewrite the LOCAL INFILE source clause into LOAD DATA FROM S3 — the only line that changes
     - |
-      sed "s|LOAD DATA INFILE '$CSV_PATH'|LOAD DATA FROM S3 '$S3_URI'|" \
+      sed "s|LOAD DATA LOCAL INFILE '$CSV_PATH'|LOAD DATA FROM S3 '$S3_URI'|" \
         sql/load_mysql.sql > /tmp/load_aurora.sql
   script:
     - mysql -h "$AURORA_HOST" -P "$AURORA_PORT" -u"$AURORA_USER" -p"$AURORA_PASSWORD" "$AURORA_DATABASE" < sql/create_table.sql
-    - mysql -h "$AURORA_HOST" -P "$AURORA_PORT" -u"$AURORA_USER" -p"$AURORA_PASSWORD" "$AURORA_DATABASE" < /tmp/load_aurora.sql
+    - mysql -h "$AURORA_HOST" -P "$AURORA_PORT" -u"$AURORA_USER" -p"$AURORA_PASSWORD" --local-infile=1 "$AURORA_DATABASE" < /tmp/load_aurora.sql
     - |
       COUNT=$(mysql -h "$AURORA_HOST" -P "$AURORA_PORT" -u"$AURORA_USER" -p"$AURORA_PASSWORD" "$AURORA_DATABASE" -N -e "SELECT COUNT(*) FROM customers;")
       echo "Row count: $COUNT"
