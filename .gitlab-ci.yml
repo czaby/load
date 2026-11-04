@@ -1,6 +1,8 @@
-# Test LOAD DATA statements against MySQL (service) and Aurora (manual).
-# Uses LOAD DATA LOCAL INFILE for the MySQL stage — no volume mounts,
-# no secure_file_priv configuration, no special Runner privileges.
+# Test the canonical LOAD DATA FROM S3 statement.
+# Default file (sql/load_data.sql) contains the production S3 statement.
+# Stage 1 rewrites the S3 clause to LOAD DATA LOCAL INFILE for a MySQL
+# service container. Stage 2 (manual) runs the untouched S3 statement
+# against a real Aurora cluster.
 # The only line that differs between stages is the source clause:
 #   MySQL:  LOAD DATA LOCAL INFILE '...'
 #   Aurora: LOAD DATA FROM S3 's3-...://...'
@@ -8,6 +10,7 @@
 variables:
   CSV_PATH: "$CI_PROJECT_DIR/sql/sample_customers.csv"
   S3_URI: "s3-us-east-1://my-bucket/imports/customers.csv"
+  LOAD_FILE: "sql/load_data.sql"
 
 stages:
   - test-mysql
@@ -15,6 +18,7 @@ stages:
 
 # ---------------------------------------------------------------------------
 # Stage 1: automatic — MySQL 8.0 service container, LOCAL INFILE
+# Rewrites the default S3 statement into LOCAL INFILE for testing.
 # ---------------------------------------------------------------------------
 test-mysql:
   stage: test-mysql
@@ -39,10 +43,10 @@ test-mysql:
       done
     - mysql -h mysql -uroot -prootpass testdb < sql/create_table.sql
   script:
-    # Client must also allow LOCAL INFILE (disabled by default)
+    # Rewrite S3 → LOCAL INFILE: the only line that changes
     - |
-      sed "s|/CI_PROJECT_DIR/sql/sample_customers.csv|$CSV_PATH|" \
-        sql/load_mysql.sql > /tmp/load_local.sql
+      sed "s|LOAD DATA FROM S3 '$S3_URI'|LOAD DATA LOCAL INFILE '$CSV_PATH'|" \
+        "$LOAD_FILE" > /tmp/load_local.sql
     - mysql -h mysql -uroot -prootpass --local-infile=1 testdb < /tmp/load_local.sql
     - |
       COUNT=$(mysql -h mysql -uroot -prootpass testdb -N -e "SELECT COUNT(*) FROM customers;")
@@ -50,7 +54,7 @@ test-mysql:
       test "$COUNT" = "2"
 
 # ---------------------------------------------------------------------------
-# Stage 2: manual — real Aurora cluster
+# Stage 2: manual — real Aurora cluster, untouched S3 statement
 # ---------------------------------------------------------------------------
 test-aurora:
   stage: test-aurora
@@ -71,13 +75,10 @@ test-aurora:
         mysqladmin ping -h "$AURORA_HOST" -P "$AURORA_PORT" -u"$AURORA_USER" -p"$AURORA_PASSWORD" --silent && break
         sleep 2
       done
-    # Rewrite the LOCAL INFILE source clause into LOAD DATA FROM S3 — the only line that changes
-    - |
-      sed "s|LOAD DATA LOCAL INFILE '$CSV_PATH'|LOAD DATA FROM S3 '$S3_URI'|" \
-        sql/load_mysql.sql > /tmp/load_aurora.sql
   script:
+    # No rewrite — run the canonical S3 statement as-is
     - mysql -h "$AURORA_HOST" -P "$AURORA_PORT" -u"$AURORA_USER" -p"$AURORA_PASSWORD" "$AURORA_DATABASE" < sql/create_table.sql
-    - mysql -h "$AURORA_HOST" -P "$AURORA_PORT" -u"$AURORA_USER" -p"$AURORA_PASSWORD" --local-infile=1 "$AURORA_DATABASE" < /tmp/load_aurora.sql
+    - mysql -h "$AURORA_HOST" -P "$AURORA_PORT" -u"$AURORA_USER" -p"$AURORA_PASSWORD" "$AURORA_DATABASE" < "$LOAD_FILE"
     - |
       COUNT=$(mysql -h "$AURORA_HOST" -P "$AURORA_PORT" -u"$AURORA_USER" -p"$AURORA_PASSWORD" "$AURORA_DATABASE" -N -e "SELECT COUNT(*) FROM customers;")
       echo "Row count: $COUNT"
